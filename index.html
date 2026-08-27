@@ -224,6 +224,16 @@ select{appearance:none; background-image:linear-gradient(45deg,transparent 50%,v
 .estado{font-size:14.5px; min-height:1.4em}
 .estado[data-tipo="error"]{color:var(--morado)}
 .estado[data-tipo="ok"]{color:var(--musgo)}
+.estado[data-tipo="espera"]{color:var(--oro)}
+
+/* aviso de respuestas guardadas sin enviar */
+.cola{position:fixed; right:16px; bottom:16px; z-index:80; display:none; align-items:center; gap:14px;
+  padding:14px 16px; background:var(--laguna); border:2px solid var(--oro); max-width:min(340px,90vw)}
+.cola[data-pendientes]{display:flex}
+.cola p{margin:0; font-size:13.5px; color:var(--tiza)}
+.cola b{display:block; font-family:var(--hud); font-size:9px; letter-spacing:.12em; color:var(--oro); margin-bottom:5px}
+.cola button{font-family:var(--hud); font-size:9px; letter-spacing:.1em; text-transform:uppercase; cursor:pointer;
+  padding:10px 12px; border:2px solid var(--agua); background:transparent; color:var(--agua); flex:none}
 .hero .btn{margin:0}
 .hero__ctas{display:flex; gap:14px; justify-content:center; flex-wrap:wrap}
 .accesos{position:relative; z-index:3; padding:34px 0 6px; scroll-margin-top:74px}
@@ -628,6 +638,11 @@ select{appearance:none; background-image:linear-gradient(45deg,transparent 50%,v
     </div>
   </div>
 </section>
+
+<aside class="cola" id="cola" aria-live="polite">
+  <p><b>Sin conexión</b><span id="cola-texto"></span></p>
+  <button type="button" id="cola-reintentar">Reintentar</button>
+</aside>
 </main>
 
 <script>
@@ -759,6 +774,96 @@ const recoge = (form) => {
   return datos;
 };
 
+/* ── cola local (IndexedDB) ──
+   Cada respuesta se guarda primero en el navegador y solo se borra cuando el
+   servidor confirma que la recibió. Sin conexión, queda en cola y se reintenta
+   sola al volver la red, al reabrir la página o cada 30 s. */
+const COLA = { db: 'siwa', almacen: 'pendientes', version: 1 };
+
+const abrirDB = () => new Promise((ok, mal) => {
+  if (!self.indexedDB) return mal(new Error('navegador sin IndexedDB'));
+  const req = indexedDB.open(COLA.db, COLA.version);
+  req.onupgradeneeded = () => req.result.createObjectStore(COLA.almacen, { keyPath: 'id', autoIncrement: true });
+  req.onsuccess = () => ok(req.result);
+  req.onerror = () => mal(req.error);
+});
+
+const operar = async (modo, fn) => {
+  const db = await abrirDB();
+  return new Promise((ok, mal) => {
+    const t = db.transaction(COLA.almacen, modo);
+    const pedido = fn(t.objectStore(COLA.almacen));
+    t.oncomplete = () => ok(pedido ? pedido.result : undefined);
+    t.onerror = () => mal(t.error);
+    t.onabort = () => mal(t.error);
+  });
+};
+
+const encolar    = (datos) => operar('readwrite', s => s.add(datos));
+const pendientes = ()      => operar('readonly',  s => s.getAll());
+const descolar   = (id)    => operar('readwrite', s => s.delete(id));
+
+const postear = async (datos) => {
+  const r = await fetch(CONFIG.endpoint, {
+    method: 'POST',
+    headers: CONFIG.formato === 'texto'
+      ? { 'Content-Type': 'text/plain;charset=utf-8' }
+      : { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify(datos)
+  });
+  if (!r.ok) throw new Error(r.status);
+};
+
+/* aviso flotante con lo que falta por enviar */
+const avisoCola = document.getElementById('cola');
+const avisoTexto = document.getElementById('cola-texto');
+const pintarAviso = (n) => {
+  if (n > 0) {
+    avisoCola.dataset.pendientes = n;
+    avisoTexto.textContent = n === 1
+      ? '1 respuesta guardada en este dispositivo, sin enviar todavía.'
+      : n + ' respuestas guardadas en este dispositivo, sin enviar todavía.';
+  } else {
+    delete avisoCola.dataset.pendientes;
+  }
+  return n;
+};
+
+const contar = async () => {
+  try { return pintarAviso((await pendientes()).length); } catch { return 0; }
+};
+
+let vaciando = false;
+const vaciarCola = async () => {
+  if (vaciando || !CONFIG.endpoint) return contar();
+  vaciando = true;
+  try {
+    for (const registro of await pendientes()) {
+      const { id, ...datos } = registro;
+      try {
+        await postear(datos);
+        await descolar(id);
+      } catch {
+        break;   // si falla una, el resto sigue en cola para el próximo intento
+      }
+    }
+  } catch { /* IndexedDB no disponible */ }
+  vaciando = false;
+  return contar();
+};
+
+document.getElementById('cola-reintentar').addEventListener('click', vaciarCola);
+addEventListener('online', vaciarCola);
+setInterval(() => { if (navigator.onLine) vaciarCola(); }, 30000);
+contar().then(n => { if (n) vaciarCola(); });
+
+const reiniciarCorazones = () => {
+  document.querySelectorAll('.corazones').forEach(c => {
+    c.dataset.valor = '0';
+    const n = c.querySelector('.nota'); if (n) n.textContent = '—';
+  });
+};
+
 const conectar = (form, estadoId, exito) => {
   const estado = document.getElementById(estadoId);
   const boton = form.querySelector('button[type=submit]');
@@ -771,7 +876,6 @@ const conectar = (form, estadoId, exito) => {
       form.reset(); estado.dataset.tipo = 'ok'; estado.textContent = exito;
       return;
     }
-
 
     const faltan = [...form.querySelectorAll('[required]')].filter(c => c.type === 'checkbox' ? !c.checked : !c.value.trim());
     if (faltan.length) {
@@ -793,29 +897,43 @@ const conectar = (form, estadoId, exito) => {
       return;
     }
 
-    boton.disabled = true;
+    const datos = recoge(form);
     const textoOriginal = boton.textContent;
-    boton.textContent = 'Enviando…';
-    try {
-      const r = await fetch(CONFIG.endpoint, {
-        method: 'POST',
-        headers: CONFIG.formato === 'texto'
-          ? { 'Content-Type': 'text/plain;charset=utf-8' }
-          : { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify(recoge(form))
-      });
-      if (!r.ok) throw new Error(r.status);
+    boton.disabled = true;
+    boton.textContent = 'Guardando…';
+
+    let enCola = false;
+    try { await encolar(datos); enCola = true; } catch { /* seguimos con envío directo */ }
+
+    if (enCola) {
+      // el dato ya está a salvo en el dispositivo: liberamos el formulario
       form.reset();
-      document.querySelectorAll('.corazones').forEach(c => { c.dataset.valor = '0'; const n = c.querySelector('.nota'); if (n) n.textContent = '—'; });
-      estado.dataset.tipo = 'ok';
-      estado.textContent = exito;
-    } catch (err) {
-      estado.dataset.tipo = 'error';
-      estado.textContent = 'No se pudo enviar. Revisa la conexión e inténtalo otra vez.';
-    } finally {
-      boton.disabled = false;
-      boton.textContent = textoOriginal;
+      reiniciarCorazones();
+      boton.textContent = 'Enviando…';
+      const restantes = await vaciarCola();
+      if (restantes === 0) {
+        estado.dataset.tipo = 'ok';
+        estado.textContent = exito;
+      } else {
+        estado.dataset.tipo = 'espera';
+        estado.textContent = 'Guardado en este dispositivo. Se envía solo en cuanto vuelva la conexión.';
+      }
+    } else {
+      boton.textContent = 'Enviando…';
+      try {
+        await postear(datos);
+        form.reset();
+        reiniciarCorazones();
+        estado.dataset.tipo = 'ok';
+        estado.textContent = exito;
+      } catch {
+        estado.dataset.tipo = 'error';
+        estado.textContent = 'No se pudo enviar. Revisa la conexión e inténtalo otra vez.';
+      }
     }
+
+    boton.disabled = false;
+    boton.textContent = textoOriginal;
   });
 };
 
